@@ -1,3 +1,7 @@
+-- Dataset name: NashvilleHousing.xlsx
+
+
+
 -- Here, we will do data cleaning using SQL.
 ''' Performed Operations:
 1.standardizing the date column.
