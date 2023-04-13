@@ -1,3 +1,7 @@
+/* For more info about this 8 week SQL challange visit https://8weeksqlchallenge.com  */
+
+
+
 SET search_path = dannys_diner;
 
 
