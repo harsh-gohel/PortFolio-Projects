@@ -1,314 +1,426 @@
-import os
-import threading
-import tempfile
-import heapq
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 import pandas as pd
-from tkinter import *
-from tkinter import filedialog, ttk, messagebox
+import os
+import multiprocessing as mp
+import math
+import duckdb
+from rapidfuzz import fuzz
+import glob
 
-# ================= CONFIG =================
-HEADERS = [
-    "Period","BatchID","ShopCode","fCrefSuffix","FCrefAltCode","Description",
-    "FCrefDecriptionSuffix","DeptCode","DeptDescription","SupplierCode",
-    "SuplierDescription","FCrefStatus","FDTGroup","FsubTag","Qty","Value",
-    "fslot3","fslot4","fslot5","fslot6","fslot7","fslot8","fslot9","fslot10",
-    "fcslot1","fcslot2","RMS_Retailer_SKU","Mercury_Store_ReceiptDescription",
-    "Mercury_Decoder_Ring_Barcode","Barcode","URL"
+# =====================================================
+# PALETTE
+# =====================================================
+BG = "#ffffff"
+CARD = "#142A3E"
+TXT = "#E6EEF5"
+MUTED = "#9BB3C4"
+ACCENT = "#2c6cf5"
+
+# =====================================================
+# CONFIG
+# =====================================================
+DB_FILE = "temp_compare.duckdb"
+
+MANDATORY_COLUMNS = [
+    "Period", "ShopCode", "Barcode",
+    "Description", "DeptDescription",
+    "Qty", "Value"
 ]
 
-MANDATORY = ["Period","ShopCode","Barcode","Description","DeptDescription","Qty","Value"]
-SORT_COLS = ["ShopCode","Barcode","Description","DeptDescription"]
-KEY_COLS = ["ShopCode","Barcode"]
+ALL_COLUMNS = [
+    "Period", "BatchID", "ShopCode", "Barcode",
+    "fCrefSuffix", "FCrefAltCode", "Description",
+    "fCrefDescriptionSuffix", "DeptCode", "DeptDescription",
+    "SupplierCode", "SupplierDescription", "FCrefStatus",
+    "FDTGroup", "FsubTag", "Qty", "Value", "fSlot3",
+    "fSlot4", "fSlot5", "fSlot6", "fSlot7", "fSlot8",
+    "fSlot9", "fSlot10", "fCSlot1", "fCSlot2",
+    "(RMS) Retailer SKU",
+    "(Mercury) Store Receipt Description",
+    "(Mercury) Decoder Ring Barcode",
+    "(eComm) Retailer Item Code",
+    "URL"
+]
 
-CHUNK_SIZE = 200000  # tune based on RAM
+OPTIONAL_COLUMNS = [
+    c for c in ALL_COLUMNS
+    if c not in MANDATORY_COLUMNS and c != "BatchID"
+]
 
-# ================= GLOBAL STATE =================
-old_file = ""
-new_file = ""
-paused = False
+old_file_path = None
+new_file_path = None
+output_dir = None
 
-# ================= UI HELPERS =================
-def select_old():
-    global old_file
-    old_file = filedialog.askopenfilename(filetypes=[("DETAIL files","*.DETAIL"),("All files","*.*")])
-    old_label.config(text=os.path.basename(old_file))
+progress_counter = None
+total_keys_global = 0
 
-def select_new():
-    global new_file
-    new_file = filedialog.askopenfilename(filetypes=[("DETAIL files","*.DETAIL"),("All files","*.*")])
-    new_label.config(text=os.path.basename(new_file))
-
-def toggle_pause():
-    global paused
-    paused = not paused
-    pause_btn.config(text="Resume" if paused else "Pause")
-
-def wait_if_paused():
-    while paused:
-        root.update()
-
-# ================= EXTERNAL SORT (STREAMING) =================
-def _chunk_sort_to_temp(input_file, temp_dir, prefix):
-    paths = []
-    for i, chunk in enumerate(pd.read_csv(input_file, sep="\t", names=HEADERS, chunksize=CHUNK_SIZE, dtype=str, keep_default_na=False)):
-        chunk = chunk.sort_values(by=SORT_COLS, kind="mergesort")
-        p = os.path.join(temp_dir, f"{prefix}_chunk_{i}.tsv")
-        chunk.to_csv(p, sep="\t", index=False, header=False)
-        paths.append(p)
-    return paths
-
-def _merge_chunks(paths, output_file):
-    # k-way merge using heap
-    files = [open(p, "r", encoding="utf-8", errors="ignore") for p in paths]
-
-    def parse(line):
-        parts = line.rstrip("\n").split("\t")
-        # pad/truncate to HEADERS length
-        if len(parts) < len(HEADERS):
-            parts += [""] * (len(HEADERS) - len(parts))
-        elif len(parts) > len(HEADERS):
-            parts = parts[:len(HEADERS)]
-        return parts
-
-    def sort_key(parts):
-        # tuple for SORT_COLS
-        return tuple(parts[HEADERS.index(c)] for c in SORT_COLS)
-
-    heap = []
-    for idx, f in enumerate(files):
-        line = f.readline()
-        if line:
-            parts = parse(line)
-            heapq.heappush(heap, (sort_key(parts), idx, parts))
-
-    with open(output_file, "w", encoding="utf-8") as out:
-        while heap:
-            _, idx, parts = heapq.heappop(heap)
-            out.write("\t".join(parts) + "\n")
-            nxt = files[idx].readline()
-            if nxt:
-                parts2 = parse(nxt)
-                heapq.heappush(heap, (sort_key(parts2), idx, parts2))
-
-    for f in files:
-        f.close()
-    for p in paths:
-        try: os.remove(p)
-        except: pass
-
-def external_sort_stream(input_file, output_file, temp_dir, prefix):
-    paths = _chunk_sort_to_temp(input_file, temp_dir, prefix)
-    _merge_chunks(paths, output_file)
-
-# ================= STREAMING GROUP READERS =================
-def _parse_line(line):
-    parts = line.rstrip("\n").split("\t")
-    if len(parts) < len(HEADERS):
-        parts += [""] * (len(HEADERS) - len(parts))
-    elif len(parts) > len(HEADERS):
-        parts = parts[:len(HEADERS)]
-    return parts
-
-def _key_from_parts(parts):
-    return f"{parts[HEADERS.index('ShopCode')]}_{parts[HEADERS.index('Barcode')]}"
-
-def _group_reader(path):
-    f = open(path, "r", encoding="utf-8", errors="ignore")
-    current_key = None
-    group = []
-    for line in f:
-        parts = _parse_line(line)
-        k = _key_from_parts(parts)
-        if current_key is None:
-            current_key = k
-            group = [parts]
-        elif k == current_key:
-            group.append(parts)
-        else:
-            yield current_key, group
-            current_key = k
-            group = [parts]
-    if current_key is not None:
-        yield current_key, group
-    f.close()
-
-def _next_group(it):
+# =====================================================
+# HELPERS
+# =====================================================
+def safe_float(v):
     try:
-        return next(it)
-    except StopIteration:
+        return float(v)
+    except:
         return None
 
-# ================= COMPARISON (STREAMING, DUP-SAFE) =================
-def compare_files():
-    global paused
+def normalize_text(s):
+    return " ".join(str(s).strip().split())
 
-    if not old_file or not new_file:
-        messagebox.showerror("Error", "Select both files")
-        return
+def similarity(a, b):
+    return fuzz.ratio(a, b) / 100
 
-    # columns to compare
-    selected_cols = [listbox.get(i) for i in listbox.curselection()]
-    cols = list(dict.fromkeys(MANDATORY + selected_cols))
+# =====================================================
+# INIT DB
+# =====================================================
+def init_db():
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
 
-    # temp workspace
-    temp_dir = tempfile.mkdtemp(prefix="cmp_")
+    conn = duckdb.connect(DB_FILE)
+    conn.execute(f"PRAGMA threads={os.cpu_count()};")
 
-    sorted_old = os.path.join(temp_dir, "old_sorted.tsv")
-    sorted_new = os.path.join(temp_dir, "new_sorted.tsv")
+    conn.execute(f"""
+        CREATE TABLE old_table AS
+        SELECT *,
+               ShopCode || '_' || Barcode AS Key
+        FROM read_csv_auto('{old_file_path}', delim='\t', ignore_errors=true)
+    """)
 
-    status.set("Sorting OLD (streaming)...")
-    external_sort_stream(old_file, sorted_old, temp_dir, "old")
+    conn.execute(f"""
+        CREATE TABLE new_table AS
+        SELECT *,
+               ShopCode || '_' || Barcode AS Key
+        FROM read_csv_auto('{new_file_path}', delim='\t', ignore_errors=true)
+    """)
 
-    status.set("Sorting NEW (streaming)...")
-    external_sort_stream(new_file, sorted_new, temp_dir, "new")
+    conn.close()
 
-    # output path = same directory as OLD file
-    out_dir = os.path.dirname(old_file) if old_file else os.getcwd()
-    output_file = os.path.join(out_dir, "comparison_output.csv")
+# =====================================================
+# WORKER
+# =====================================================
+def compare_chunk(args):
+    keys, compare_cols, progress_counter = args
 
-    status.set("Comparing (streaming)...")
+    conn = duckdb.connect(DB_FILE)
 
-    # prepare writers
-    with open(output_file, "w", encoding="utf-8") as out:
+    output_file = f"temp_{os.getpid()}.csv"
+    first_write = not os.path.exists(output_file)
 
-        # header
-        header = ["Key"]
-        for c in cols:
-            header += [f"Old_{c}", f"New_{c}", f"{c}_check"]
-        header.append("Complete_match")
-        out.write(",".join(header) + "\n")
+    for key in keys:
+        o_rows = conn.execute(
+            "SELECT * FROM old_table WHERE Key = ?", [key]
+        ).fetchdf()
 
-        # iterators
-        it_old = _group_reader(sorted_old)
-        it_new = _group_reader(sorted_new)
+        n_rows = conn.execute(
+            "SELECT * FROM new_table WHERE Key = ?", [key]
+        ).fetchdf()
 
-        g_old = _next_group(it_old)
-        g_new = _next_group(it_new)
+        used_o, used_n = set(), set()
 
-        processed = 0
+        def row_similarity(o, n):
+            return (
+                similarity(normalize_text(o["Description"]),
+                           normalize_text(n["Description"])) * 0.7 +
+                similarity(normalize_text(o["DeptDescription"]),
+                           normalize_text(n["DeptDescription"])) * 0.3
+            )
 
-        while g_old is not None or g_new is not None:
-            wait_if_paused()
+        pairs = []
+        for oi, o in o_rows.iterrows():
+            for ni, n in n_rows.iterrows():
+                pairs.append((row_similarity(o, n), oi, ni))
 
-            if g_old is None:
-                key = g_new[0]
-                old_rows = []
-                new_rows = g_new[1]
-                g_new = _next_group(it_new)
-            elif g_new is None:
-                key = g_old[0]
-                old_rows = g_old[1]
-                new_rows = []
-                g_old = _next_group(it_old)
-            else:
-                key_old, rows_old = g_old
-                key_new, rows_new = g_new
+        pairs.sort(reverse=True)
 
-                if key_old == key_new:
-                    key = key_old
-                    old_rows = rows_old
-                    new_rows = rows_new
-                    g_old = _next_group(it_old)
-                    g_new = _next_group(it_new)
-                elif key_old < key_new:
-                    key = key_old
-                    old_rows = rows_old
-                    new_rows = []
-                    g_old = _next_group(it_old)
+        rows_out = []
+
+        for sim, oi, ni in pairs:
+            if oi in used_o or ni in used_n:
+                continue
+
+            used_o.add(oi)
+            used_n.add(ni)
+
+            rec = {"Key": key}
+            o = o_rows.loc[oi]
+            n = n_rows.loc[ni]
+
+            for col in compare_cols:
+                ov, nv = o.get(col), n.get(col)
+
+                rec[f"Old_{col}"] = ov if pd.notna(ov) else "Not Found"
+                rec[f"New_{col}"] = nv if pd.notna(nv) else "Not Found"
+
+                if pd.isna(ov) or pd.isna(nv):
+                    rec[f"{col}_Check"] = "Not Found"
+                elif col in ["Qty", "Value"]:
+                    rec[f"{col}_Check"] = (
+                        "Match" if safe_float(ov) == safe_float(nv)
+                        else "Mismatch"
+                    )
                 else:
-                    key = key_new
-                    old_rows = []
-                    new_rows = rows_new
-                    g_new = _next_group(it_new)
+                    rec[f"{col}_Check"] = (
+                        "Match" if str(ov) == str(nv)
+                        else "Mismatch"
+                    )
 
-            max_len = max(len(old_rows), len(new_rows))
+            rec["Complete_Match"] = all(
+                rec[f"{c}_Check"] == "Match" for c in compare_cols
+            )
 
-            for i in range(max_len):
-                old_parts = old_rows[i] if i < len(old_rows) else [""] * len(HEADERS)
-                new_parts = new_rows[i] if i < len(new_rows) else [""] * len(HEADERS)
+            rows_out.append(rec)
 
-                row_out = [key]
-                complete = True
+        if rows_out:
+            pd.DataFrame(rows_out).to_csv(
+                output_file,
+                mode="a",
+                index=False,
+                header=first_write
+            )
+            first_write = False
 
-                for c in cols:
-                    idx = HEADERS.index(c)
-                    old_val = old_parts[idx]
-                    new_val = new_parts[idx]
+        # update progress
+        with progress_counter.get_lock():
+            progress_counter.value += 1
 
-                    check = "match" if str(old_val) == str(new_val) else "mismatch"
-                    if check == "mismatch":
-                        complete = False
+    conn.close()
+    return output_file
 
-                    row_out += [str(old_val), str(new_val), check]
+# =====================================================
+# CONTROLLER
+# =====================================================
+def compare_files():
+    global progress_counter, total_keys_global
 
-                row_out.append(str(complete))
+    progress_frame.pack(fill="x", pady=10)
+    progress_bar["value"] = 0
+    progress_lbl.config(text="Initializing...")
 
-                if output_option.get() == "Mismatch Only" and complete:
-                    continue
+    selected_optional = [opt_list.get(i) for i in opt_list.curselection()]
+    compare_cols = MANDATORY_COLUMNS + selected_optional
 
-                out.write(",".join(row_out) + "\n")
+    init_db()
 
-            processed += 1
-            if processed % 100 == 0:
-                prog_label.config(text=f"Groups processed: {processed}")
-                progress['value'] = (processed % 1000) / 10  # rolling progress (streaming)
-                root.update_idletasks()
+    conn = duckdb.connect(DB_FILE)
 
-    status.set(f"Done! Output saved at: {output_file}")
-    messagebox.showinfo("Completed", f"Output saved at:\n{output_file}")
+    all_keys = conn.execute("""
+        SELECT DISTINCT Key FROM old_table
+        UNION
+        SELECT DISTINCT Key FROM new_table
+    """).fetchall()
 
-# ================= THREAD =================
-def start_compare():
-    threading.Thread(target=compare_files, daemon=True).start()
+    conn.close()
 
-# ================= UI =================
-root = Tk()
-root.title("DETAIL File Comparator (Streaming, Duplicate-Safe)")
-root.geometry("920x680")
+    all_keys = [k[0] for k in all_keys]
+    total_keys_global = len(all_keys)
 
-Label(root, text="DETAIL File Comparator", font=("Arial", 16, "bold")).pack(pady=10)
+    manager = mp.Manager()
+    progress_counter = manager.Value('i', 0)
 
-frame = Frame(root)
-frame.pack(pady=10)
+    cpu = max(1, os.cpu_count() - 1)
+    chunk_size = math.ceil(len(all_keys) / cpu)
+    chunks = [all_keys[i:i + chunk_size] for i in range(0, len(all_keys), chunk_size)]
 
-Button(frame, text="Select Old File", width=20, command=select_old).grid(row=0, column=0, padx=10, pady=5)
-old_label = Label(frame, text="No file selected")
-old_label.grid(row=0, column=1)
+    pool = mp.Pool(cpu)
 
-Button(frame, text="Select New File", width=20, command=select_new).grid(row=1, column=0, padx=10, pady=5)
-new_label = Label(frame, text="No file selected")
-new_label.grid(row=1, column=1)
+    async_results = [
+        pool.apply_async(compare_chunk, ((chunk, compare_cols, progress_counter),))
+        for chunk in chunks
+    ]
 
-Label(root, text="Mandatory Columns:", font=("Arial", 10, "bold")).pack()
-Label(root, text=", ".join(MANDATORY)).pack(pady=5)
+    pool.close()
 
-Label(root, text="Select Additional Columns:").pack()
-listbox = Listbox(root, selectmode=MULTIPLE, width=65, height=10)
-for col in HEADERS:
-    if col not in MANDATORY:
-        listbox.insert(END, col)
-listbox.pack(pady=5)
+    temp_files = []
 
-output_option = StringVar(value="Full Comparison")
-opt_frame = Frame(root)
-opt_frame.pack()
-Radiobutton(opt_frame, text="Full Comparison", variable=output_option, value="Full Comparison").pack(side=LEFT, padx=10)
-Radiobutton(opt_frame, text="Mismatch Only", variable=output_option, value="Mismatch Only").pack(side=LEFT, padx=10)
+    def poll():
+        done = progress_counter.value
+        percent = (done / total_keys_global) * 100 if total_keys_global else 0
 
-progress = ttk.Progressbar(root, length=520)
-progress.pack(pady=10)
+        progress_bar["value"] = percent
+        progress_bar["maximum"] = 100
+        progress_lbl.config(text=f"{percent:.2f}% ({done}/{total_keys_global})")
 
-prog_label = Label(root, text="Groups processed: 0")
-prog_label.pack()
+        for r in async_results[:]:
+            if r.ready():
+                try:
+                    temp_files.append(r.get())
+                except Exception as e:
+                    print("Worker error:", e)
+                async_results.remove(r)
 
-status = StringVar(value="Idle")
-Label(root, textvariable=status, fg="blue").pack(pady=5)
+        if async_results:
+            root.after(100, poll)
+        else:
+            pool.join()
+            finalize_files(compare_cols)
 
-btn_frame = Frame(root)
-btn_frame.pack(pady=10)
+    poll()
 
-Button(btn_frame, text="Compare Files", width=20, command=start_compare).grid(row=0, column=0, padx=10)
-pause_btn = Button(btn_frame, text="Pause", width=20, command=toggle_pause)
-pause_btn.grid(row=0, column=1, padx=10)
+# =====================================================
+# FINALIZE
+# =====================================================
+def finalize_files(compare_cols):
+    files = glob.glob("temp_*.csv")
 
-root.mainloop()
+    comp_df = pd.concat((pd.read_csv(f) for f in files), ignore_index=True)
+
+    check_cols = [f"{c}_Check" for c in compare_cols]
+
+    # -------------------------------------------------
+    # Apply comparison mode filter (RESTORED)
+    # -------------------------------------------------
+    if mode_var.get() == "MISMATCH":
+        mask = (
+            comp_df[check_cols].eq("Mismatch").any(axis=1) |
+            comp_df[check_cols].eq("Not Found").any(axis=1)
+        )
+        output_df = comp_df.loc[mask]
+    else:
+        output_df = comp_df
+
+    output_df.to_csv(
+        os.path.join(output_dir, "Comparison.csv"),
+        index=False
+    )
+
+    # cleanup temp files
+    for f in files:
+        os.remove(f)
+
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+
+    progress_lbl.config(text="✅ Completed")
+    messagebox.showinfo("SirpairIQ", "Comparison completed successfully")
+# =====================================================
+# LOADERS
+# =====================================================
+def load_old():
+    global old_file_path, output_dir
+    p = filedialog.askopenfilename()
+    if p:
+        old_file_path = p
+        output_dir = os.path.dirname(p)
+        old_lbl.config(text=f"Old File: {os.path.basename(p)} ✅")
+        validate_ready()
+
+def load_new():
+    global new_file_path
+    p = filedialog.askopenfilename()
+    if p:
+        new_file_path = p
+        new_lbl.config(text=f"New File: {os.path.basename(p)} ✅")
+        validate_ready()
+
+def validate_ready():
+    if old_file_path and new_file_path:
+        compare_btn.config(state="normal")
+
+# =====================================================
+# UI (UNCHANGED)
+# =====================================================
+root = tk.Tk()
+root.title("SirpairIQ")
+root.geometry("960x740")
+root.configure(bg=BG)
+
+style = ttk.Style(root)
+style.configure(
+    "NIQ.Horizontal.TProgressbar",
+    troughcolor="#e6e9f0",
+    background=ACCENT,
+    thickness=6
+)
+
+tk.Label(
+    root, text="SirpairIQ",
+    bg=BG, fg=ACCENT,
+    font=("Segoe UI", 24, "bold")
+).pack(pady=10)
+
+card = tk.Frame(root, bg=CARD)
+card.pack(fill="both", expand=True, padx=25, pady=10)
+
+tk.Label(card, text="Mandatory Columns", bg=CARD, fg=TXT,
+         font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=5)
+
+tk.Label(card, text=", ".join(MANDATORY_COLUMNS),
+         bg=CARD, fg=MUTED, wraplength=880).pack(anchor="w", padx=20)
+
+tk.Label(card, text="Optional Columns (Multi-Select)", bg=CARD, fg=TXT,
+         font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=10)
+
+opt_list = tk.Listbox(
+    card, selectmode=tk.MULTIPLE, height=10,
+    bg=BG, fg="black", selectbackground=ACCENT
+)
+for c in OPTIONAL_COLUMNS:
+    opt_list.insert(tk.END, c)
+opt_list.pack(fill="x", padx=20)
+
+old_lbl = tk.Label(card, text="Old File: Not selected", bg=CARD, fg=MUTED)
+new_lbl = tk.Label(card, text="New File: Not selected", bg=CARD, fg=MUTED)
+old_lbl.pack(anchor="w", padx=20, pady=5)
+new_lbl.pack(anchor="w", padx=20)
+
+tk.Button(card, text="Load Old File", bg=ACCENT, fg="white",
+          command=load_old).pack(pady=4)
+
+tk.Button(card, text="Load New File", bg=ACCENT, fg="white",
+          command=load_new).pack(pady=4)
+
+compare_btn = tk.Button(
+    card, text="Compare Files",
+    bg=ACCENT, fg="white",
+    state="disabled",
+    command=compare_files
+)
+compare_btn.pack(pady=10)
+
+# --- Comparison Mode ---
+mode_var = tk.StringVar(value="FULL")
+
+tk.Label(card, text="Comparison Mode", bg=CARD, fg=TXT,
+         font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=20, pady=(10, 2))
+
+mode_frame = tk.Frame(card, bg=CARD)
+mode_frame.pack(anchor="w", padx=20)
+
+tk.Radiobutton(
+    mode_frame,
+    text="Full Comparison",
+    variable=mode_var,
+    value="FULL",
+    bg=CARD,
+    fg=TXT,
+    selectcolor=CARD,
+    activebackground=CARD,
+    activeforeground=TXT
+).pack(side="left")
+
+tk.Radiobutton(
+    mode_frame,
+    text="Mismatch / Extra Only",
+    variable=mode_var,
+    value="MISMATCH",
+    bg=CARD,
+    fg=TXT,
+    selectcolor=CARD,
+    activebackground=CARD,
+    activeforeground=TXT
+).pack(side="left", padx=15)
+
+
+
+progress_frame = tk.Frame(card, bg=CARD)
+progress_bar = ttk.Progressbar(progress_frame, style="NIQ.Horizontal.TProgressbar")
+progress_lbl = tk.Label(progress_frame, bg=CARD, fg=MUTED)
+progress_bar.pack(fill="x", padx=20)
+progress_lbl.pack()
+progress_frame.pack(fill="x", pady=10)
+progress_frame.pack_forget()
+
+if __name__ == "__main__":
+    mp.freeze_support()
+    root.mainloop()
