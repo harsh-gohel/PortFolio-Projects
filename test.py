@@ -3,11 +3,13 @@ from tkinter import filedialog, messagebox, ttk
 import duckdb
 import os
 import threading
+import tempfile
+import shutil
 from rapidfuzz.process import cdist
 from rapidfuzz import fuzz
 
 # =====================================================
-# UI COLORS (UNCHANGED)
+# UI COLORS
 # =====================================================
 BG = "#ffffff"
 CARD = "#142A3E"
@@ -61,6 +63,21 @@ def safe_float(v):
 def norm(x):
     return " ".join(str(x).lower().strip().split())
 
+def safe_copy(path):
+    try:
+        path = os.path.abspath(path)
+        temp_path = os.path.join(tempfile.gettempdir(), os.path.basename(path))
+        shutil.copy2(path, temp_path)
+        return temp_path
+    except Exception as e:
+        raise Exception(
+            "Cannot access file.\n\n"
+            "Please ensure:\n"
+            "- File is NOT open in Excel\n"
+            "- You have read permission\n\n"
+            f"Details: {str(e)}"
+        )
+
 # =====================================================
 # INIT DB
 # =====================================================
@@ -73,36 +90,42 @@ def init_db():
 
     col_def = ", ".join([f'"{c}" VARCHAR' for c in ALL_COLUMNS])
 
+    old_safe = safe_copy(old_file_path)
+    new_safe = safe_copy(new_file_path)
+
     try:
         conn.execute(f"CREATE TABLE old_table ({col_def});")
         conn.execute(f"""
             INSERT INTO old_table
-            SELECT * FROM read_csv('{old_file_path}', delim='\t', header=False);
+            SELECT * FROM read_csv('{old_safe}', delim='\t', header=False);
         """)
 
         conn.execute(f"CREATE TABLE new_table ({col_def});")
         conn.execute(f"""
             INSERT INTO new_table
-            SELECT * FROM read_csv('{new_file_path}', delim='\t', header=False);
+            SELECT * FROM read_csv('{new_safe}', delim='\t', header=False);
         """)
 
-        conn.execute("""
-            ALTER TABLE old_table ADD COLUMN Key VARCHAR;
-            UPDATE old_table SET Key = ShopCode || '_' || Barcode;
-        """)
+        conn.execute("ALTER TABLE old_table ADD COLUMN Key VARCHAR;")
+        conn.execute("UPDATE old_table SET Key = ShopCode || '_' || Barcode;")
 
-        conn.execute("""
-            ALTER TABLE new_table ADD COLUMN Key VARCHAR;
-            UPDATE new_table SET Key = ShopCode || '_' || Barcode;
-        """)
+        conn.execute("ALTER TABLE new_table ADD COLUMN Key VARCHAR;")
+        conn.execute("UPDATE new_table SET Key = ShopCode || '_' || Barcode;")
 
     except Exception as e:
-        raise Exception("Invalid file format.\nEnsure tab-separated file without headers.\n\n" + str(e))
+        raise Exception(
+            "File format issue.\n\n"
+            "Ensure:\n"
+            "- Tab-separated file\n"
+            "- No header row\n"
+            "- Correct column order\n\n"
+            f"Details: {str(e)}"
+        )
 
     return conn
 
 # =====================================================
-# CORE PROCESS (WITH MODE FILTER)
+# CORE PROCESS
 # =====================================================
 def process(compare_cols):
     conn = init_db()
@@ -185,9 +208,7 @@ def process(compare_cols):
 
                     complete_match = all(c == "Match" for c in checks)
 
-                    # =========================================
-                    # APPLY MODE FILTER HERE (FAST)
-                    # =========================================
+                    # MODE FILTER
                     if mode_var.get() == "MISMATCH":
                         if not any(c in ("Mismatch", "Not Found") for c in checks):
                             continue
@@ -212,7 +233,7 @@ def process(compare_cols):
         conn.close()
 
     except Exception as e:
-        raise Exception("Processing failed:\n\n" + str(e))
+        raise Exception("Processing failed.\n\n" + str(e))
 
 # =====================================================
 # THREAD WRAPPER
@@ -264,7 +285,7 @@ def validate_ready():
         compare_btn.config(state="normal")
 
 # =====================================================
-# UI (UNCHANGED + MODE RESTORED)
+# UI (UNCHANGED)
 # =====================================================
 root = tk.Tk()
 root.title("SirpairIQ")
@@ -316,14 +337,10 @@ compare_btn = tk.Button(card, text="Compare Files",
                         command=compare_files)
 compare_btn.pack(pady=10)
 
-# --- MODE (RESTORED) ---
 mode_var = tk.StringVar(value="FULL")
 
-tk.Label(card, text="Comparison Mode", bg=CARD, fg=TXT,
-         font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=20, pady=(10, 2))
-
 mode_frame = tk.Frame(card, bg=CARD)
-mode_frame.pack(anchor="w", padx=20)
+mode_frame.pack(anchor="w", padx=20, pady=10)
 
 tk.Radiobutton(mode_frame, text="Full Comparison",
                variable=mode_var, value="FULL",
