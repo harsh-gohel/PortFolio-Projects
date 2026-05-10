@@ -8,6 +8,8 @@ import threading
 import multiprocessing as mp
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
+import gc
+import stat
 
 import duckdb
 import pyarrow as pa
@@ -100,13 +102,44 @@ def ensure_dirs():
         os.makedirs(d, exist_ok=True)
 
 
-def cleanup_temp():
-    try:
-        if os.path.exists(TEMP_ROOT):
-            shutil.rmtree(TEMP_ROOT)
-    except:
-        pass
+def cleanup_temp(retries=10, delay=1):
+    """
+    Safely remove temp folder on Windows.
+    Handles:
+    - locked parquet files
+    - delayed file handles
+    - readonly files
+    - multiprocessing cleanup delays
+    """
 
+    gc.collect()
+
+    if not os.path.exists(TEMP_ROOT):
+        return
+
+    def on_rm_error(func, path, exc_info):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except:
+            pass
+
+    for attempt in range(retries):
+        try:
+            shutil.rmtree(
+                TEMP_ROOT,
+                onerror=on_rm_error
+            )
+
+            return
+
+        except PermissionError:
+            time.sleep(delay)
+
+        except Exception:
+            time.sleep(delay)
+
+    print(f"WARNING: Could not fully remove temp folder: {TEMP_ROOT}")
 
 def safe_float(v):
     try:
@@ -482,6 +515,7 @@ def write_summary(summary_all, compare_cols):
 # MAIN ENGINE
 # ============================================================
 def run_comparison():
+
     global output_dir
 
     if not old_file_path or not new_file_path:
@@ -567,6 +601,9 @@ def run_comparison():
     root.update_idletasks()
 
     write_summary(summary_all, compare_cols)
+    # Ensure all workers/files are released
+    time.sleep(2)
+    gc.collect()
 
     cleanup_temp()
 
