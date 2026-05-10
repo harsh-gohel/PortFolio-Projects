@@ -17,6 +17,11 @@ import pyarrow.parquet as pq
 import polars as pl
 from rapidfuzz.fuzz import ratio
 
+
+import tempfile
+import uuid
+
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -49,7 +54,14 @@ APP_NAME = "SirpairIQ"
 NUM_PARTITIONS = max(16, (os.cpu_count() or 4) * 4)
 CHUNK_SIZE = 250_000
 BUFFER_SIZE = 1024 * 1024 * 8
-TEMP_ROOT = "sirpairiq_temp"
+
+
+TEMP_ROOT = os.path.join(
+    tempfile.gettempdir(),
+    f"sirpairiq_{uuid.uuid4().hex}"
+)
+
+
 
 MANDATORY_COLUMNS = [
     "Period", "ShopCode", "Barcode",
@@ -89,7 +101,13 @@ CANCEL = mp.Event()
 # ============================================================
 # HELPERS
 # ============================================================
+
+# ============================================================
+# SAFE TEMP DIRECTORY CREATION
+# ============================================================
 def ensure_dirs():
+    global TEMP_ROOT
+
     dirs = [
         TEMP_ROOT,
         os.path.join(TEMP_ROOT, "old"),
@@ -99,7 +117,19 @@ def ensure_dirs():
     ]
 
     for d in dirs:
-        os.makedirs(d, exist_ok=True)
+        try:
+            os.makedirs(d, exist_ok=True)
+
+        except PermissionError as e:
+            raise Exception(
+                f"Cannot create temp directory:\n{d}\n\n"
+                f"Windows denied access.\n"
+                f"Try running from another folder or as Administrator."
+            ) from e
+
+
+
+
 
 
 def cleanup_temp(retries=10, delay=1):
